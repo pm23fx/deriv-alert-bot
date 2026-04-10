@@ -65,11 +65,17 @@ SYMBOL_CATEGORIES = {
     "🥇 Metals": [
         "frxXAUUSD", "frxXAGUSD", "frxXPDUSD", "frxXPTUSD",
     ],
-    "📈 Volatility": [
-        "R_10", "R_25", "R_50", "R_75", "R_100",
+    "📈 Vol 10-50": [
+        "R_10", "R_25", "R_50",
     ],
-    "📈 Volatility 1s": [
-        "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+    "📈 Vol 75-250": [
+        "R_75", "R_100", "R_150", "R_200", "R_250",
+    ],
+    "📈 Vol 1s (10-50)": [
+        "1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V", "1HZ50V",
+    ],
+    "📈 Vol 1s (75-300)": [
+        "1HZ75V", "1HZ90V", "1HZ100V", "1HZ150V", "1HZ200V", "1HZ250V", "1HZ300V",
     ],
     "💥 Crash / Boom": [
         "CRASH300N", "CRASH500N", "CRASH1000N",
@@ -78,13 +84,11 @@ SYMBOL_CATEGORIES = {
     "🦘 Jump Indices": [
         "JD10", "JD25", "JD50", "JD75", "JD100",
     ],
-    "📊 Range/Step/Drift": [
-        "stpRNG", "RDBEAR", "RDBULL",
-        "DSI10", "DSI20", "DSI30",
+    "🪜 Step Indices": [
+        "stpRNG", "stpRNG2", "stpRNG3", "stpRNG4", "stpRNG5",
     ],
-    "📊 DEX Indices": [
-        "DEX600DN", "DEX600UP", "DEX900DN", "DEX900UP",
-        "DEX1500DN", "DEX1500UP",
+    "🔀 Drift Switch": [
+        "DSI10", "DSI20", "DSI30",
     ],
 }
 
@@ -94,8 +98,31 @@ for syms in SYMBOL_CATEGORIES.values():
 ALL_SYMBOLS = list(dict.fromkeys(ALL_SYMBOLS))
 
 SYMBOL_NAMES = {}
+# Friendly names for all symbols
+FRIENDLY = {
+    # Standard Volatility
+    "R_10": "V10", "R_25": "V25", "R_50": "V50",
+    "R_75": "V75", "R_100": "V100", "R_150": "V150", "R_200": "V200", "R_250": "V250",
+    # 1-second Volatility
+    "1HZ10V": "V10 (1s)", "1HZ15V": "V15 (1s)", "1HZ25V": "V25 (1s)",
+    "1HZ30V": "V30 (1s)", "1HZ50V": "V50 (1s)", "1HZ75V": "V75 (1s)",
+    "1HZ90V": "V90 (1s)", "1HZ100V": "V100 (1s)",
+    "1HZ150V": "V150 (1s)", "1HZ200V": "V200 (1s)", "1HZ250V": "V250 (1s)", "1HZ300V": "V300 (1s)",
+    # Crash / Boom
+    "CRASH300N": "Crash 300", "CRASH500N": "Crash 500", "CRASH1000N": "Crash 1000",
+    "BOOM300N": "Boom 300", "BOOM500N": "Boom 500", "BOOM1000N": "Boom 1000",
+    # Jump
+    "JD10": "Jump 10", "JD25": "Jump 25", "JD50": "Jump 50", "JD75": "Jump 75", "JD100": "Jump 100",
+    # Step
+    "stpRNG": "Step Index", "stpRNG2": "Step 200", "stpRNG3": "Step 300",
+    "stpRNG4": "Step 400", "stpRNG5": "Step 500",
+    # Drift Switch
+    "DSI10": "Drift 10", "DSI20": "Drift 20", "DSI30": "Drift 30",
+}
 for s in ALL_SYMBOLS:
-    if s.startswith("frx"):
+    if s in FRIENDLY:
+        SYMBOL_NAMES[s] = FRIENDLY[s]
+    elif s.startswith("frx"):
         pair = s.replace("frx", "")
         if pair.startswith("X"):
             SYMBOL_NAMES[s] = pair
