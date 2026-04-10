@@ -1,7 +1,8 @@
 """
-PM23FX Deriv Alert Bot
+PM23FX Deriv Alert Bot v2
+- Interactive inline keyboard for pair selection
 - Streams live ticks from Deriv WebSocket API
-- Custom price alerts via Telegram commands
+- Custom price alerts via Telegram
 - All forex pairs + all Deriv synthetic indices
 - Runs 24/7 on Railway free tier
 """
@@ -14,17 +15,21 @@ import sqlite3
 from datetime import datetime, timezone
 
 import aiohttp
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    ConversationHandler,
+    filters,
 )
 
 # ── Config ──────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
-DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"  # Public app_id
+DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 # ── Logging ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -33,60 +38,90 @@ logging.basicConfig(
 )
 log = logging.getLogger("DerivBot")
 
+# ── Conversation states ─────────────────────────────────────────────────
+PICK_CATEGORY, PICK_PAIR, PICK_DIRECTION, ENTER_PRICE = range(4)
+PRICE_PICK_PAIR = 10
+
 # ── Symbol Registry ─────────────────────────────────────────────────────
-FOREX_PAIRS = [
-    # Majors
-    "frxAUDCAD", "frxAUDCHF", "frxAUDJPY", "frxAUDNZD", "frxAUDUSD",
-    "frxEURAUD", "frxEURCAD", "frxEURCHF", "frxEURGBP", "frxEURJPY",
-    "frxEURNZD", "frxEURUSD",
-    "frxGBPAUD", "frxGBPCAD", "frxGBPCHF", "frxGBPJPY", "frxGBPNZD",
-    "frxGBPUSD",
-    "frxNZDCAD", "frxNZDCHF", "frxNZDJPY", "frxNZDUSD",
-    "frxUSDCAD", "frxUSDCHF", "frxUSDJPY", "frxUSDMXN", "frxUSDNOK",
-    "frxUSDPLN", "frxUSDSEK", "frxUSDZAR",
-    # Metals
-    "frxXAUUSD", "frxXAGUSD", "frxXPDUSD", "frxXPTUSD",
-]
+SYMBOL_CATEGORIES = {
+    "💱 Forex Majors": [
+        "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxUSDCHF",
+        "frxAUDUSD", "frxNZDUSD", "frxUSDCAD",
+    ],
+    "💱 EUR Crosses": [
+        "frxEURAUD", "frxEURCAD", "frxEURCHF", "frxEURGBP",
+        "frxEURJPY", "frxEURNZD",
+    ],
+    "💱 GBP Crosses": [
+        "frxGBPAUD", "frxGBPCAD", "frxGBPCHF", "frxGBPJPY", "frxGBPNZD",
+    ],
+    "💱 AUD/NZD Crosses": [
+        "frxAUDCAD", "frxAUDCHF", "frxAUDJPY", "frxAUDNZD",
+        "frxNZDCAD", "frxNZDCHF", "frxNZDJPY",
+    ],
+    "💱 USD Exotics": [
+        "frxUSDMXN", "frxUSDNOK", "frxUSDPLN", "frxUSDSEK", "frxUSDZAR",
+    ],
+    "🥇 Metals": [
+        "frxXAUUSD", "frxXAGUSD", "frxXPDUSD", "frxXPTUSD",
+    ],
+    "📈 Volatility": [
+        "R_10", "R_25", "R_50", "R_75", "R_100",
+    ],
+    "📈 Volatility 1s": [
+        "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+    ],
+    "💥 Crash / Boom": [
+        "CRASH300N", "CRASH500N", "CRASH1000N",
+        "BOOM300N", "BOOM500N", "BOOM1000N",
+    ],
+    "🦘 Jump Indices": [
+        "JD10", "JD25", "JD50", "JD75", "JD100",
+    ],
+    "📊 Range/Step/Drift": [
+        "stpRNG", "RDBEAR", "RDBULL",
+        "DSI10", "DSI20", "DSI30",
+    ],
+    "📊 DEX Indices": [
+        "DEX600DN", "DEX600UP", "DEX900DN", "DEX900UP",
+        "DEX1500DN", "DEX1500UP",
+    ],
+}
 
-DERIV_INDICES = [
-    # Volatility Indices
-    "R_10", "R_25", "R_50", "R_75", "R_100",
-    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
-    # Crash / Boom
-    "BOOM300N", "BOOM500N", "BOOM1000N",
-    "CRASH300N", "CRASH500N", "CRASH1000N",
-    # Step Index
-    "stpRNG",
-    # Jump Indices
-    "JD10", "JD25", "JD50", "JD75", "JD100",
-    # Range Break
-    "RDBEAR", "RDBULL",
-    # Drift Switch
-    "DSI10", "DSI20", "DSI30",
-    # DEX Indices
-    "DEX600DN", "DEX600UP", "DEX900DN", "DEX900UP",
-    "DEX1500DN", "DEX1500UP",
-]
+ALL_SYMBOLS = []
+for syms in SYMBOL_CATEGORIES.values():
+    ALL_SYMBOLS.extend(syms)
+ALL_SYMBOLS = list(dict.fromkeys(ALL_SYMBOLS))
 
-ALL_SYMBOLS = FOREX_PAIRS + DERIV_INDICES
-
-# Friendly name mapping
 SYMBOL_NAMES = {}
-for s in FOREX_PAIRS:
-    pair = s.replace("frx", "")
-    SYMBOL_NAMES[s] = f"{pair[:3]}/{pair[3:]}" if "X" not in pair[:3] else pair
-for s in DERIV_INDICES:
-    SYMBOL_NAMES[s] = s
+for s in ALL_SYMBOLS:
+    if s.startswith("frx"):
+        pair = s.replace("frx", "")
+        if pair.startswith("X"):
+            SYMBOL_NAMES[s] = pair
+        else:
+            SYMBOL_NAMES[s] = f"{pair[:3]}/{pair[3:]}"
+    else:
+        SYMBOL_NAMES[s] = s
 
-# Reverse lookup: user-friendly name -> deriv symbol
 REVERSE_LOOKUP = {}
 for sym, name in SYMBOL_NAMES.items():
     REVERSE_LOOKUP[name.upper()] = sym
     REVERSE_LOOKUP[name.upper().replace("/", "")] = sym
     REVERSE_LOOKUP[sym.upper()] = sym
-    # Also allow lowercase without prefix
     clean = sym.replace("frx", "").upper()
     REVERSE_LOOKUP[clean] = sym
+
+
+def resolve_symbol(user_input: str) -> str | None:
+    key = user_input.strip().upper().replace("/", "")
+    if key in REVERSE_LOOKUP:
+        return REVERSE_LOOKUP[key]
+    for name, sym in REVERSE_LOOKUP.items():
+        if key in name:
+            return sym
+    return None
+
 
 # ── Database ────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "alerts.db")
@@ -98,7 +133,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
-            direction TEXT NOT NULL,  -- 'above' or 'below'
+            direction TEXT NOT NULL,
             target_price REAL NOT NULL,
             created_at TEXT NOT NULL,
             triggered INTEGER DEFAULT 0,
@@ -159,67 +194,324 @@ def delete_all_alerts() -> int:
     return count
 
 
-# ── Resolve user input to Deriv symbol ──────────────────────────────────
-def resolve_symbol(user_input: str) -> str | None:
-    key = user_input.strip().upper().replace("/", "")
-    if key in REVERSE_LOOKUP:
-        return REVERSE_LOOKUP[key]
-    # Fuzzy: check if input is substring
-    for name, sym in REVERSE_LOOKUP.items():
-        if key in name:
-            return sym
-    return None
-
-
 # ── Global state ────────────────────────────────────────────────────────
 latest_prices: dict[str, float] = {}
 telegram_app: Application = None
-ws_connection = None
 
 
-# ── Telegram Commands ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE ALERT FLOW:  /setalert → Category → Pair → Direction → Price
+# ══════════════════════════════════════════════════════════════════════════
+
+async def cmd_setalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != CHAT_ID:
+        return ConversationHandler.END
+
+    buttons = []
+    cats = list(SYMBOL_CATEGORIES.keys())
+    for i in range(0, len(cats), 2):
+        row = [InlineKeyboardButton(cats[i], callback_data=f"cat:{cats[i]}")]
+        if i + 1 < len(cats):
+            row.append(InlineKeyboardButton(cats[i + 1], callback_data=f"cat:{cats[i + 1]}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+
+    await update.message.reply_text(
+        "📊 *Set Price Alert*\nPick a category:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    return PICK_CATEGORY
+
+
+async def pick_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    category = query.data.replace("cat:", "")
+    symbols = SYMBOL_CATEGORIES.get(category, [])
+
+    buttons = []
+    for i in range(0, len(symbols), 2):
+        row = []
+        for sym in symbols[i:i + 2]:
+            name = SYMBOL_NAMES.get(sym, sym)
+            price = latest_prices.get(sym)
+            label = f"{name} ({price})" if price else name
+            row.append(InlineKeyboardButton(label, callback_data=f"pair:{sym}"))
+        buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="back_to_cats"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+    ])
+
+    await query.edit_message_text(
+        f"📊 *{category}*\nSelect a pair:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    return PICK_PAIR
+
+
+async def back_to_cats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    buttons = []
+    cats = list(SYMBOL_CATEGORIES.keys())
+    for i in range(0, len(cats), 2):
+        row = [InlineKeyboardButton(cats[i], callback_data=f"cat:{cats[i]}")]
+        if i + 1 < len(cats):
+            row.append(InlineKeyboardButton(cats[i + 1], callback_data=f"cat:{cats[i + 1]}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+
+    await query.edit_message_text(
+        "📊 *Set Price Alert*\nPick a category:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    return PICK_CATEGORY
+
+
+async def pick_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return ConversationHandler.END
+    if query.data == "back_to_cats":
+        return await back_to_cats(update, ctx)
+
+    symbol = query.data.replace("pair:", "")
+    ctx.user_data["alert_symbol"] = symbol
+    name = SYMBOL_NAMES.get(symbol, symbol)
+    price = latest_prices.get(symbol)
+    price_str = f"\nCurrent price: *{price}*" if price else ""
+
+    buttons = [
+        [
+            InlineKeyboardButton("🔺 Above", callback_data="dir:above"),
+            InlineKeyboardButton("🔻 Below", callback_data="dir:below"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+    ]
+
+    await query.edit_message_text(
+        f"📊 *{name}*{price_str}\n\nAlert when price goes:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    return PICK_DIRECTION
+
+
+async def pick_direction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    direction = query.data.replace("dir:", "")
+    ctx.user_data["alert_direction"] = direction
+    symbol = ctx.user_data["alert_symbol"]
+    name = SYMBOL_NAMES.get(symbol, symbol)
+    price = latest_prices.get(symbol)
+    price_str = f" (current: {price})" if price else ""
+    arrow = "🔺" if direction == "above" else "🔻"
+
+    await query.edit_message_text(
+        f"{arrow} *{name}* — alert {direction}{price_str}\n\n"
+        f"Now type the target price:",
+        parse_mode="Markdown",
+    )
+    return ENTER_PRICE
+
+
+async def enter_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != CHAT_ID:
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    try:
+        price = float(text)
+    except ValueError:
+        await update.message.reply_text("❌ Invalid price. Type a number like `195.50`", parse_mode="Markdown")
+        return ENTER_PRICE
+
+    symbol = ctx.user_data.get("alert_symbol")
+    direction = ctx.user_data.get("alert_direction")
+    if not symbol or not direction:
+        await update.message.reply_text("❌ Something went wrong. Use /setalert again.")
+        return ConversationHandler.END
+
+    alert_id = add_alert(symbol, direction, price)
+    name = SYMBOL_NAMES.get(symbol, symbol)
+    current = latest_prices.get(symbol)
+    cur_str = f"\n📍 Current: {current}" if current else ""
+    arrow = "🔺" if direction == "above" else "🔻"
+
+    await update.message.reply_text(
+        f"✅ *Alert #{alert_id} Set!*\n\n"
+        f"{arrow} {name} {direction} *{price}*{cur_str}",
+        parse_mode="Markdown",
+    )
+    log.info(f"Alert #{alert_id}: {name} {direction} {price}")
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("❌ Cancelled.")
+    else:
+        await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE PRICE CHECK:  /price → Category → Prices list
+# ══════════════════════════════════════════════════════════════════════════
+
+async def cmd_price_interactive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != CHAT_ID:
+        return ConversationHandler.END
+
+    if ctx.args:
+        symbol = resolve_symbol(ctx.args[0])
+        if not symbol:
+            await update.message.reply_text(f"❌ Unknown symbol: `{ctx.args[0]}`", parse_mode="Markdown")
+            return ConversationHandler.END
+        name = SYMBOL_NAMES.get(symbol, symbol)
+        current = latest_prices.get(symbol)
+        if current:
+            await update.message.reply_text(f"📊 {name}: *{current}*", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"⏳ {name}: waiting for first tick...")
+        return ConversationHandler.END
+
+    buttons = []
+    cats = list(SYMBOL_CATEGORIES.keys())
+    for i in range(0, len(cats), 2):
+        row = [InlineKeyboardButton(cats[i], callback_data=f"pcat:{cats[i]}")]
+        if i + 1 < len(cats):
+            row.append(InlineKeyboardButton(cats[i + 1], callback_data=f"pcat:{cats[i + 1]}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+
+    await update.message.reply_text(
+        "📊 *Check Price*\nPick a category:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    return PRICE_PICK_PAIR
+
+
+async def price_pick_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    category = query.data.replace("pcat:", "")
+    symbols = SYMBOL_CATEGORIES.get(category, [])
+
+    lines = [f"📊 *{category}*\n"]
+    for sym in symbols:
+        name = SYMBOL_NAMES.get(sym, sym)
+        price = latest_prices.get(sym)
+        if price:
+            lines.append(f"  {name}: *{price}*")
+        else:
+            lines.append(f"  {name}: ⏳")
+
+    buttons = [[
+        InlineKeyboardButton("⬅️ Back", callback_data="pback"),
+        InlineKeyboardButton("❌ Close", callback_data="cancel"),
+    ]]
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    return PRICE_PICK_PAIR
+
+
+async def price_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    buttons = []
+    cats = list(SYMBOL_CATEGORIES.keys())
+    for i in range(0, len(cats), 2):
+        row = [InlineKeyboardButton(cats[i], callback_data=f"pcat:{cats[i]}")]
+        if i + 1 < len(cats):
+            row.append(InlineKeyboardButton(cats[i + 1], callback_data=f"pcat:{cats[i + 1]}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+
+    await query.edit_message_text(
+        "📊 *Check Price*\nPick a category:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    return PRICE_PICK_PAIR
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SIMPLE COMMANDS
+# ══════════════════════════════════════════════════════════════════════════
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != CHAT_ID:
         return
     text = (
         "🤖 *PM23FX Deriv Alert Bot*\n\n"
-        "Commands:\n"
-        "`/alert SYMBOL above|below PRICE`\n"
-        "  → Set a price alert\n\n"
-        "`/alerts` → List active alerts\n"
-        "`/price SYMBOL` → Get current price\n"
-        "`/delete ID` → Delete an alert\n"
-        "`/clearall` → Delete all alerts\n"
-        "`/symbols` → List available symbols\n"
-        "`/help` → Show this message\n\n"
-        "Examples:\n"
-        "`/alert GBPJPY above 195.50`\n"
-        "`/alert XAUUSD below 2300`\n"
-        "`/alert R_100 above 6500`\n"
-        "`/alert BOOM1000N above 9500`\n"
-        "`/price EURUSD`"
+        "*Interactive (tap to select):*\n"
+        "  /setalert → Pick pair & set alert\n"
+        "  /price → Check live prices\n\n"
+        "*Quick commands:*\n"
+        "  `/alert GBPJPY above 195.50`\n"
+        "  `/price EURUSD`\n\n"
+        "*Manage:*\n"
+        "  /alerts → List active alerts\n"
+        "  /delete ID → Delete an alert\n"
+        "  /clearall → Clear all alerts\n"
+        "  /symbols → List all symbols\n"
+        "  /help → This message"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-async def cmd_alert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_alert_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != CHAT_ID:
         return
     args = ctx.args
     if not args or len(args) < 3:
         await update.message.reply_text(
             "❌ Usage: `/alert SYMBOL above|below PRICE`\n"
-            "Example: `/alert GBPJPY above 195.50`",
+            "Or use /setalert for interactive mode!",
             parse_mode="Markdown",
         )
         return
 
-    symbol_input = args[0]
-    direction = args[1].lower()
+    symbol_input, direction, price_str = args[0], args[1].lower(), args[2]
     try:
-        price = float(args[2])
+        price = float(price_str)
     except ValueError:
-        await update.message.reply_text("❌ Invalid price. Use a number like `195.50`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Invalid price.", parse_mode="Markdown")
         return
 
     if direction not in ("above", "below"):
@@ -228,22 +520,14 @@ async def cmd_alert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     symbol = resolve_symbol(symbol_input)
     if not symbol:
-        await update.message.reply_text(
-            f"❌ Unknown symbol: `{symbol_input}`\nUse `/symbols` to see available symbols.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(f"❌ Unknown: `{symbol_input}`\nUse /setalert for interactive mode.", parse_mode="Markdown")
         return
 
     alert_id = add_alert(symbol, direction, price)
     name = SYMBOL_NAMES.get(symbol, symbol)
     current = latest_prices.get(symbol)
-    current_str = f"  (current: {current})" if current else ""
-
-    await update.message.reply_text(
-        f"✅ Alert #{alert_id} set!\n"
-        f"📊 {name} {direction} {price}{current_str}",
-    )
-    log.info(f"Alert #{alert_id}: {name} {direction} {price}")
+    cur_str = f"  (current: {current})" if current else ""
+    await update.message.reply_text(f"✅ Alert #{alert_id}: {name} {direction} {price}{cur_str}")
 
 
 async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -251,7 +535,7 @@ async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     alerts = get_active_alerts()
     if not alerts:
-        await update.message.reply_text("📭 No active alerts.")
+        await update.message.reply_text("📭 No active alerts.\nUse /setalert to set one!")
         return
 
     lines = ["📋 *Active Alerts:*\n"]
@@ -259,29 +543,9 @@ async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name = SYMBOL_NAMES.get(sym, sym)
         current = latest_prices.get(sym)
         cur_str = f" (now: {current})" if current else ""
-        lines.append(f"  `#{aid}` {name} {direction} {price}{cur_str}")
-
+        arrow = "🔺" if direction == "above" else "🔻"
+        lines.append(f"  {arrow} `#{aid}` {name} {direction} {price}{cur_str}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/price SYMBOL`", parse_mode="Markdown")
-        return
-
-    symbol = resolve_symbol(ctx.args[0])
-    if not symbol:
-        await update.message.reply_text(f"❌ Unknown symbol: `{ctx.args[0]}`", parse_mode="Markdown")
-        return
-
-    name = SYMBOL_NAMES.get(symbol, symbol)
-    current = latest_prices.get(symbol)
-    if current:
-        await update.message.reply_text(f"📊 {name}: *{current}*", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"⏳ {name}: waiting for first tick...")
 
 
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -295,7 +559,6 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid ID")
         return
-
     if delete_alert(aid):
         await update.message.reply_text(f"🗑 Alert #{aid} deleted.")
     else:
@@ -312,23 +575,16 @@ async def cmd_clearall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_symbols(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != CHAT_ID:
         return
-
-    forex_names = [SYMBOL_NAMES[s] for s in FOREX_PAIRS]
-    index_names = [SYMBOL_NAMES[s] for s in DERIV_INDICES]
-
-    text = (
-        "📊 *Available Symbols*\n\n"
-        f"*Forex ({len(FOREX_PAIRS)}):*\n"
-        f"`{', '.join(forex_names)}`\n\n"
-        f"*Deriv Indices ({len(DERIV_INDICES)}):*\n"
-        f"`{', '.join(index_names)}`"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    lines = ["📊 *Available Symbols*\n"]
+    for cat, syms in SYMBOL_CATEGORIES.items():
+        names = [SYMBOL_NAMES.get(s, s) for s in syms]
+        lines.append(f"*{cat}:*")
+        lines.append(f"  `{', '.join(names)}`\n")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-# ── Deriv WebSocket Price Streaming ─────────────────────────────────────
+# ── Deriv WebSocket ─────────────────────────────────────────────────────
 async def send_telegram_alert(alert_id: int, symbol: str, direction: str, target: float, current: float):
-    """Send alert notification via Telegram."""
     name = SYMBOL_NAMES.get(symbol, symbol)
     arrow = "🔺" if direction == "above" else "🔻"
     msg = (
@@ -348,7 +604,6 @@ async def send_telegram_alert(alert_id: int, symbol: str, direction: str, target
 
 
 def check_alerts(symbol: str, price: float):
-    """Check if any alerts are triggered by the current price."""
     alerts = get_active_alerts()
     for aid, sym, direction, target in alerts:
         if sym != symbol:
@@ -358,56 +613,42 @@ def check_alerts(symbol: str, price: float):
             triggered = True
         elif direction == "below" and price <= target:
             triggered = True
-
         if triggered:
             mark_triggered(aid)
-            # Schedule the Telegram notification
             asyncio.get_event_loop().create_task(
                 send_telegram_alert(aid, symbol, direction, target, price)
             )
 
 
 async def stream_deriv_ticks():
-    """Connect to Deriv WS and stream ticks for all symbols."""
-    global ws_connection
-
     while True:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(DERIV_WS_URL) as ws:
-                    ws_connection = ws
-                    log.info(f"✅ Connected to Deriv WebSocket")
+                    log.info("✅ Connected to Deriv WebSocket")
 
-                    # Subscribe to all symbols
                     for i, symbol in enumerate(ALL_SYMBOLS):
-                        sub_msg = {
-                            "ticks": symbol,
-                            "subscribe": 1,
-                        }
-                        await ws.send_json(sub_msg)
-                        # Small delay to avoid rate limiting
+                        await ws.send_json({"ticks": symbol, "subscribe": 1})
                         if i % 10 == 9:
                             await asyncio.sleep(0.5)
 
                     log.info(f"📡 Subscribed to {len(ALL_SYMBOLS)} symbols")
 
-                    # Send startup notification
                     try:
                         bot = telegram_app.bot
                         await bot.send_message(
                             chat_id=CHAT_ID,
                             text=(
-                                f"🟢 *PM23FX Deriv Alert Bot Online*\n"
-                                f"Monitoring {len(FOREX_PAIRS)} forex pairs + "
-                                f"{len(DERIV_INDICES)} Deriv indices\n"
-                                f"Use /help for commands"
+                                f"🟢 *PM23FX Deriv Alert Bot v2 Online*\n"
+                                f"Monitoring {len(ALL_SYMBOLS)} symbols\n"
+                                f"Use /setalert to set alerts (interactive)\n"
+                                f"Use /help for all commands"
                             ),
                             parse_mode="Markdown",
                         )
                     except Exception as e:
                         log.error(f"Startup notification failed: {e}")
 
-                    # Process incoming ticks
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
@@ -421,32 +662,27 @@ async def stream_deriv_ticks():
                             elif "error" in data:
                                 err = data["error"]
                                 log.warning(f"Deriv error: {err.get('message', err)}")
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            log.error(f"WebSocket error: {ws.exception()}")
-                            break
-                        elif msg.type == aiohttp.WSMsgType.CLOSED:
-                            log.warning("WebSocket closed by server")
+                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                             break
 
         except Exception as e:
-            log.error(f"WebSocket connection error: {e}")
+            log.error(f"WebSocket error: {e}")
 
-        # Reconnect after 5 seconds
         log.info("🔄 Reconnecting in 5 seconds...")
         await asyncio.sleep(5)
 
 
 # ── Main ────────────────────────────────────────────────────────────────
 async def post_init(application: Application):
-    """Set bot commands menu after initialization."""
     commands = [
-        BotCommand("alert", "Set price alert: /alert SYMBOL above|below PRICE"),
-        BotCommand("alerts", "List active alerts"),
-        BotCommand("price", "Get current price: /price SYMBOL"),
-        BotCommand("delete", "Delete alert: /delete ID"),
-        BotCommand("clearall", "Clear all alerts"),
-        BotCommand("symbols", "List available symbols"),
-        BotCommand("help", "Show help"),
+        BotCommand("setalert", "🎯 Set alert (interactive)"),
+        BotCommand("price", "📊 Check price (interactive)"),
+        BotCommand("alert", "Quick: /alert SYMBOL above|below PRICE"),
+        BotCommand("alerts", "📋 List active alerts"),
+        BotCommand("delete", "🗑 Delete alert by ID"),
+        BotCommand("clearall", "🗑 Clear all alerts"),
+        BotCommand("symbols", "📊 List all symbols"),
+        BotCommand("help", "❓ Show help"),
     ]
     await application.bot.set_my_commands(commands)
     log.info("Bot commands menu set")
@@ -462,10 +698,8 @@ async def main():
         log.error("TELEGRAM_CHAT_ID not set!")
         return
 
-    # Init database
     init_db()
 
-    # Build Telegram bot
     telegram_app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -473,23 +707,63 @@ async def main():
         .build()
     )
 
-    # Register handlers
+    # ── Interactive /setalert conversation ──
+    setalert_conv = ConversationHandler(
+        entry_points=[CommandHandler("setalert", cmd_setalert)],
+        states={
+            PICK_CATEGORY: [
+                CallbackQueryHandler(cancel_conv, pattern="^cancel$"),
+                CallbackQueryHandler(pick_category, pattern="^cat:"),
+            ],
+            PICK_PAIR: [
+                CallbackQueryHandler(cancel_conv, pattern="^cancel$"),
+                CallbackQueryHandler(back_to_cats, pattern="^back_to_cats$"),
+                CallbackQueryHandler(pick_pair, pattern="^pair:"),
+            ],
+            PICK_DIRECTION: [
+                CallbackQueryHandler(cancel_conv, pattern="^cancel$"),
+                CallbackQueryHandler(pick_direction, pattern="^dir:"),
+            ],
+            ENTER_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_price),
+                CommandHandler("cancel", cancel_conv),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        per_user=True,
+        per_chat=True,
+    )
+
+    # ── Interactive /price conversation ──
+    price_conv = ConversationHandler(
+        entry_points=[CommandHandler("price", cmd_price_interactive)],
+        states={
+            PRICE_PICK_PAIR: [
+                CallbackQueryHandler(cancel_conv, pattern="^cancel$"),
+                CallbackQueryHandler(price_back, pattern="^pback$"),
+                CallbackQueryHandler(price_pick_category, pattern="^pcat:"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        per_user=True,
+        per_chat=True,
+    )
+
+    telegram_app.add_handler(setalert_conv)
+    telegram_app.add_handler(price_conv)
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("help", cmd_start))
-    telegram_app.add_handler(CommandHandler("alert", cmd_alert))
+    telegram_app.add_handler(CommandHandler("alert", cmd_alert_quick))
     telegram_app.add_handler(CommandHandler("alerts", cmd_alerts))
-    telegram_app.add_handler(CommandHandler("price", cmd_price))
     telegram_app.add_handler(CommandHandler("delete", cmd_delete))
     telegram_app.add_handler(CommandHandler("clearall", cmd_clearall))
     telegram_app.add_handler(CommandHandler("symbols", cmd_symbols))
 
-    # Start Telegram polling + Deriv streaming concurrently
     async with telegram_app:
         await telegram_app.start()
         await telegram_app.updater.start_polling(drop_pending_updates=True)
         log.info("🤖 Telegram bot started")
 
-        # Run Deriv WebSocket streaming
         try:
             await stream_deriv_ticks()
         except asyncio.CancelledError:
