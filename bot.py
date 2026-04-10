@@ -28,7 +28,7 @@ from telegram.ext import (
 
 # ── Config ──────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+ADMIN_CHAT_ID = int(os.getenv("TELEGRAM_ADMIN_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "0")) or "0")
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 # ── Logging ─────────────────────────────────────────────────────────────
@@ -78,17 +78,14 @@ SYMBOL_CATEGORIES = {
         "1HZ75V", "1HZ90V", "1HZ100V", "1HZ150V", "1HZ200V", "1HZ250V", "1HZ300V",
     ],
     "💥 Crash / Boom": [
-        "CRASH300N", "CRASH500N", "CRASH1000N",
-        "BOOM300N", "BOOM500N", "BOOM1000N",
+        "CRASH50N", "CRASH150N", "CRASH300N", "CRASH500N", "CRASH600N", "CRASH900N", "CRASH1000N",
+        "BOOM50N", "BOOM150N", "BOOM300N", "BOOM500N", "BOOM600N", "BOOM900N", "BOOM1000N",
     ],
     "🦘 Jump Indices": [
         "JD10", "JD25", "JD50", "JD75", "JD100",
     ],
     "🪜 Step Indices": [
         "stpRNG", "stpRNG2", "stpRNG3", "stpRNG4", "stpRNG5",
-    ],
-    "🔀 Drift Switch": [
-        "DSI10", "DSI20", "DSI30",
     ],
 }
 
@@ -109,15 +106,15 @@ FRIENDLY = {
     "1HZ90V": "V90 (1s)", "1HZ100V": "V100 (1s)",
     "1HZ150V": "V150 (1s)", "1HZ200V": "V200 (1s)", "1HZ250V": "V250 (1s)", "1HZ300V": "V300 (1s)",
     # Crash / Boom
-    "CRASH300N": "Crash 300", "CRASH500N": "Crash 500", "CRASH1000N": "Crash 1000",
-    "BOOM300N": "Boom 300", "BOOM500N": "Boom 500", "BOOM1000N": "Boom 1000",
+    "CRASH50N": "Crash 50", "CRASH150N": "Crash 150", "CRASH300N": "Crash 300", "CRASH500N": "Crash 500",
+    "CRASH600N": "Crash 600", "CRASH900N": "Crash 900", "CRASH1000N": "Crash 1000",
+    "BOOM50N": "Boom 50", "BOOM150N": "Boom 150", "BOOM300N": "Boom 300", "BOOM500N": "Boom 500",
+    "BOOM600N": "Boom 600", "BOOM900N": "Boom 900", "BOOM1000N": "Boom 1000",
     # Jump
     "JD10": "Jump 10", "JD25": "Jump 25", "JD50": "Jump 50", "JD75": "Jump 75", "JD100": "Jump 100",
     # Step
     "stpRNG": "Step Index", "stpRNG2": "Step 200", "stpRNG3": "Step 300",
     "stpRNG4": "Step 400", "stpRNG5": "Step 500",
-    # Drift Switch
-    "DSI10": "Drift 10", "DSI20": "Drift 20", "DSI30": "Drift 30",
 }
 for s in ALL_SYMBOLS:
     if s in FRIENDLY:
@@ -135,7 +132,10 @@ REVERSE_LOOKUP = {}
 for sym, name in SYMBOL_NAMES.items():
     REVERSE_LOOKUP[name.upper()] = sym
     REVERSE_LOOKUP[name.upper().replace("/", "")] = sym
+    REVERSE_LOOKUP[name.upper().replace("/", "").replace(" ", "")] = sym
     REVERSE_LOOKUP[sym.upper()] = sym
+    if sym.upper().endswith("N"):
+        REVERSE_LOOKUP[sym.upper()[:-1]] = sym
     clean = sym.replace("frx", "").upper()
     REVERSE_LOOKUP[clean] = sym
 
@@ -159,6 +159,7 @@ def init_db():
     conn.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL DEFAULT 0,
             symbol TEXT NOT NULL,
             direction TEXT NOT NULL,
             target_price REAL NOT NULL,
@@ -167,16 +168,21 @@ def init_db():
             triggered_at TEXT
         )
     """)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+    if "chat_id" not in columns:
+        conn.execute("ALTER TABLE alerts ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0")
+        if ADMIN_CHAT_ID:
+            conn.execute("UPDATE alerts SET chat_id = ? WHERE chat_id = 0", (ADMIN_CHAT_ID,))
     conn.commit()
     conn.close()
     log.info("Database initialized")
 
 
-def add_alert(symbol: str, direction: str, price: float) -> int:
+def add_alert(chat_id: int, symbol: str, direction: str, price: float) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
-        "INSERT INTO alerts (symbol, direction, target_price, created_at) VALUES (?, ?, ?, ?)",
-        (symbol, direction, price, datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO alerts (chat_id, symbol, direction, target_price, created_at) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, symbol, direction, price, datetime.now(timezone.utc).isoformat()),
     )
     alert_id = cur.lastrowid
     conn.commit()
@@ -184,10 +190,20 @@ def add_alert(symbol: str, direction: str, price: float) -> int:
     return alert_id
 
 
-def get_active_alerts():
+def get_active_alerts(chat_id: int):
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT id, symbol, direction, target_price FROM alerts WHERE triggered = 0"
+        "SELECT id, symbol, direction, target_price FROM alerts WHERE chat_id = ? AND triggered = 0",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_active_alerts():
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, chat_id, symbol, direction, target_price FROM alerts WHERE triggered = 0"
     ).fetchall()
     conn.close()
     return rows
@@ -203,18 +219,18 @@ def mark_triggered(alert_id: int):
     conn.close()
 
 
-def delete_alert(alert_id: int) -> bool:
+def delete_alert(chat_id: int, alert_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+    cur = conn.execute("DELETE FROM alerts WHERE id = ? AND chat_id = ?", (alert_id, chat_id))
     deleted = cur.rowcount > 0
     conn.commit()
     conn.close()
     return deleted
 
 
-def delete_all_alerts() -> int:
+def delete_all_alerts(chat_id: int) -> int:
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute("DELETE FROM alerts WHERE triggered = 0")
+    cur = conn.execute("DELETE FROM alerts WHERE chat_id = ? AND triggered = 0", (chat_id,))
     count = cur.rowcount
     conn.commit()
     conn.close()
@@ -231,9 +247,6 @@ telegram_app: Application = None
 # ══════════════════════════════════════════════════════════════════════════
 
 async def cmd_setalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return ConversationHandler.END
-
     buttons = []
     cats = list(SYMBOL_CATEGORIES.keys())
     for i in range(0, len(cats), 2):
@@ -363,9 +376,6 @@ async def pick_direction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def enter_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return ConversationHandler.END
-
     text = update.message.text.strip()
     try:
         price = float(text)
@@ -379,7 +389,7 @@ async def enter_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Something went wrong. Use /setalert again.")
         return ConversationHandler.END
 
-    alert_id = add_alert(symbol, direction, price)
+    alert_id = add_alert(update.effective_chat.id, symbol, direction, price)
     name = SYMBOL_NAMES.get(symbol, symbol)
     current = latest_prices.get(symbol)
     cur_str = f"\n📍 Current: {current}" if current else ""
@@ -410,9 +420,6 @@ async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════
 
 async def cmd_price_interactive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return ConversationHandler.END
-
     if ctx.args:
         symbol = resolve_symbol(ctx.args[0])
         if not symbol:
@@ -502,8 +509,6 @@ async def price_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
     text = (
         "🤖 *PM23FX Deriv Alert Bot*\n\n"
         "*Interactive (tap to select):*\n"
@@ -523,8 +528,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_alert_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
     args = ctx.args
     if not args or len(args) < 3:
         await update.message.reply_text(
@@ -550,7 +553,7 @@ async def cmd_alert_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Unknown: `{symbol_input}`\nUse /setalert for interactive mode.", parse_mode="Markdown")
         return
 
-    alert_id = add_alert(symbol, direction, price)
+    alert_id = add_alert(update.effective_chat.id, symbol, direction, price)
     name = SYMBOL_NAMES.get(symbol, symbol)
     current = latest_prices.get(symbol)
     cur_str = f"  (current: {current})" if current else ""
@@ -558,9 +561,7 @@ async def cmd_alert_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
-    alerts = get_active_alerts()
+    alerts = get_active_alerts(update.effective_chat.id)
     if not alerts:
         await update.message.reply_text("📭 No active alerts.\nUse /setalert to set one!")
         return
@@ -576,8 +577,6 @@ async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
     if not ctx.args:
         await update.message.reply_text("Usage: `/delete ID`", parse_mode="Markdown")
         return
@@ -586,22 +585,18 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid ID")
         return
-    if delete_alert(aid):
+    if delete_alert(update.effective_chat.id, aid):
         await update.message.reply_text(f"🗑 Alert #{aid} deleted.")
     else:
         await update.message.reply_text(f"❌ Alert #{aid} not found.")
 
 
 async def cmd_clearall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
-    count = delete_all_alerts()
+    count = delete_all_alerts(update.effective_chat.id)
     await update.message.reply_text(f"🗑 Cleared {count} alert(s).")
 
 
 async def cmd_symbols(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
     lines = ["📊 *Available Symbols*\n"]
     for cat, syms in SYMBOL_CATEGORIES.items():
         names = [SYMBOL_NAMES.get(s, s) for s in syms]
@@ -611,7 +606,7 @@ async def cmd_symbols(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Deriv WebSocket ─────────────────────────────────────────────────────
-async def send_telegram_alert(alert_id: int, symbol: str, direction: str, target: float, current: float):
+async def send_telegram_alert(chat_id: int, alert_id: int, symbol: str, direction: str, target: float, current: float):
     name = SYMBOL_NAMES.get(symbol, symbol)
     arrow = "🔺" if direction == "above" else "🔻"
     msg = (
@@ -624,15 +619,15 @@ async def send_telegram_alert(alert_id: int, symbol: str, direction: str, target
     )
     try:
         bot = telegram_app.bot
-        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+        await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
         log.info(f"🔔 Alert #{alert_id} triggered: {name} {direction} {target} (current: {current})")
     except Exception as e:
         log.error(f"Failed to send Telegram alert: {e}")
 
 
 def check_alerts(symbol: str, price: float):
-    alerts = get_active_alerts()
-    for aid, sym, direction, target in alerts:
+    alerts = get_all_active_alerts()
+    for aid, chat_id, sym, direction, target in alerts:
         if sym != symbol:
             continue
         triggered = False
@@ -643,7 +638,7 @@ def check_alerts(symbol: str, price: float):
         if triggered:
             mark_triggered(aid)
             asyncio.get_event_loop().create_task(
-                send_telegram_alert(aid, symbol, direction, target, price)
+                send_telegram_alert(chat_id, aid, symbol, direction, target, price)
             )
 
 
@@ -661,20 +656,21 @@ async def stream_deriv_ticks():
 
                     log.info(f"📡 Subscribed to {len(ALL_SYMBOLS)} symbols")
 
-                    try:
+                    if ADMIN_CHAT_ID:
                         bot = telegram_app.bot
-                        await bot.send_message(
-                            chat_id=CHAT_ID,
-                            text=(
-                                f"🟢 *PM23FX Deriv Alert Bot v2 Online*\n"
-                                f"Monitoring {len(ALL_SYMBOLS)} symbols\n"
-                                f"Use /setalert to set alerts (interactive)\n"
-                                f"Use /help for all commands"
-                            ),
-                            parse_mode="Markdown",
-                        )
-                    except Exception as e:
-                        log.error(f"Startup notification failed: {e}")
+                        try:
+                            await bot.send_message(
+                                chat_id=ADMIN_CHAT_ID,
+                                text=(
+                                    f"🟢 *PM23FX Deriv Alert Bot v2 Online*\n"
+                                    f"Monitoring {len(ALL_SYMBOLS)} symbols\n"
+                                    f"Use /setalert to set alerts (interactive)\n"
+                                    f"Use /help for all commands"
+                                ),
+                                parse_mode="Markdown",
+                            )
+                        except Exception as e:
+                            log.error(f"Startup notification failed: {e}")
 
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -720,9 +716,6 @@ async def main():
 
     if not BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN not set!")
-        return
-    if CHAT_ID == 0:
-        log.error("TELEGRAM_CHAT_ID not set!")
         return
 
     init_db()

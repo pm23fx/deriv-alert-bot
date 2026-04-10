@@ -7,7 +7,8 @@ Custom price alert bot for Deriv — streams live ticks via WebSocket and sends 
 - 📈 **30+ Deriv synthetic indices** (Volatility, Crash/Boom, Jump, DEX, etc.)
 - ⚡ Real-time tick streaming via Deriv WebSocket API
 - 🔔 Instant Telegram alerts when price levels are hit
-- 💾 SQLite database for persistent alert storage
+- 👥 Public Telegram bot: every chat gets its own separate alerts
+- 💾 SQLite database for persistent per-user alert storage
 - 🔄 Auto-reconnect on connection drops
 
 ## Telegram Commands
@@ -26,7 +27,7 @@ Custom price alert bot for Deriv — streams live ticks via WebSocket and sends 
 /alert GBPJPY above 195.50
 /alert XAUUSD below 2300
 /alert R_100 above 6500
-/alert BOOM1000N above 9500
+/alert BOOM900 above 9500
 /price EURUSD
 ```
 
@@ -36,11 +37,12 @@ Custom price alert bot for Deriv — streams live ticks via WebSocket and sends 
 2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
 3. Add environment variables:
    - `TELEGRAM_BOT_TOKEN` = your bot token
-   - `TELEGRAM_CHAT_ID` = your chat ID
+   - `TELEGRAM_ADMIN_CHAT_ID` = optional admin chat ID for startup notifications
 4. Railway auto-deploys. Done!
 
 ## Environment Variables
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | ✅ | Telegram bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | ✅ | Your Telegram user/chat ID |
+| `TELEGRAM_ADMIN_CHAT_ID` | ❌ | Optional admin chat ID for startup notifications |
+| `TELEGRAM_CHAT_ID` | ❌ | Legacy fallback for `TELEGRAM_ADMIN_CHAT_ID` |
