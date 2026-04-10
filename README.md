@@ -7,6 +7,9 @@ Custom price alert bot for Deriv — streams live ticks via WebSocket and sends 
 - 📈 **30+ Deriv synthetic indices** (Volatility, Crash/Boom, Jump, DEX, etc.)
 - ⚡ Real-time tick streaming via Deriv WebSocket API
 - 🔔 Instant Telegram alerts when price levels are hit
+- 🏷 Optional labels for alerts
+- ⏸ Pause/resume alerts without deleting them
+- 🎯 Crossing-only triggers to avoid instant alerts when a level is already passed
 - 👥 Public Telegram bot: every chat gets its own separate alerts
 - 💾 SQLite database for persistent per-user alert storage
 - 🔄 Auto-reconnect on connection drops
@@ -18,6 +21,8 @@ Custom price alert bot for Deriv — streams live ticks via WebSocket and sends 
 | `/alerts` | List all active alerts |
 | `/price SYMBOL` | Get current price |
 | `/delete ID` | Delete an alert by ID |
+| `/pause ID` | Pause an alert |
+| `/resume ID` | Resume a paused alert |
 | `/clearall` | Clear all active alerts |
 | `/symbols` | List all available symbols |
 | `/help` | Show help message |
@@ -26,6 +31,7 @@ Custom price alert bot for Deriv — streams live ticks via WebSocket and sends 
 ```
 /alert GBPJPY above 195.50
 /alert XAUUSD below 2300
+/alert XAUUSD above 4775 gold breakout
 /alert R_100 above 6500
 /alert BOOM900 above 9500
 /price EURUSD

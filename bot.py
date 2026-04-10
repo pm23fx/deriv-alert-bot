@@ -7,6 +7,8 @@ PM23FX Deriv Alert Bot v2
 - Runs 24/7 on Railway free tier
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -150,6 +152,25 @@ def resolve_symbol(user_input: str) -> str | None:
     return None
 
 
+def parse_price_and_label(text: str) -> tuple[float, str | None]:
+    parts = text.strip().split(maxsplit=1)
+    if not parts:
+        raise ValueError("missing price")
+    price = float(parts[0])
+    label = parts[1].strip() if len(parts) > 1 else None
+    return price, label or None
+
+
+def md_escape(text: str) -> str:
+    for char in ("\\", "`", "*", "_", "["):
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
+def format_label(label: str | None) -> str:
+    return f"\nNote: {md_escape(label)}" if label else ""
+
+
 # ── Database ────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "alerts.db")
 
@@ -163,6 +184,10 @@ def init_db():
             symbol TEXT NOT NULL,
             direction TEXT NOT NULL,
             target_price REAL NOT NULL,
+            label TEXT,
+            created_price REAL,
+            paused INTEGER DEFAULT 0,
+            armed INTEGER DEFAULT 1,
             created_at TEXT NOT NULL,
             triggered INTEGER DEFAULT 0,
             triggered_at TEXT
@@ -173,16 +198,38 @@ def init_db():
         conn.execute("ALTER TABLE alerts ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0")
         if ADMIN_CHAT_ID:
             conn.execute("UPDATE alerts SET chat_id = ? WHERE chat_id = 0", (ADMIN_CHAT_ID,))
+    for column, definition in {
+        "label": "TEXT",
+        "created_price": "REAL",
+        "paused": "INTEGER DEFAULT 0",
+        "armed": "INTEGER DEFAULT 1",
+    }.items():
+        if column not in columns:
+            conn.execute(f"ALTER TABLE alerts ADD COLUMN {column} {definition}")
     conn.commit()
     conn.close()
     log.info("Database initialized")
 
 
-def add_alert(chat_id: int, symbol: str, direction: str, price: float) -> int:
+def should_arm_alert(direction: str, target: float, current: float | None) -> int:
+    if current is None:
+        return 1
+    if direction == "above":
+        return int(current < target)
+    return int(current > target)
+
+
+def add_alert(chat_id: int, symbol: str, direction: str, price: float, label: str | None = None) -> int:
+    current = latest_prices.get(symbol)
+    armed = should_arm_alert(direction, price, current)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
-        "INSERT INTO alerts (chat_id, symbol, direction, target_price, created_at) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, symbol, direction, price, datetime.now(timezone.utc).isoformat()),
+        """
+        INSERT INTO alerts
+            (chat_id, symbol, direction, target_price, label, created_price, armed, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (chat_id, symbol, direction, price, label, current, armed, datetime.now(timezone.utc).isoformat()),
     )
     alert_id = cur.lastrowid
     conn.commit()
@@ -193,17 +240,26 @@ def add_alert(chat_id: int, symbol: str, direction: str, price: float) -> int:
 def get_active_alerts(chat_id: int):
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT id, symbol, direction, target_price FROM alerts WHERE chat_id = ? AND triggered = 0",
+        """
+        SELECT id, symbol, direction, target_price, label, paused, armed
+        FROM alerts
+        WHERE chat_id = ? AND triggered = 0
+        ORDER BY symbol, target_price, id
+        """,
         (chat_id,),
     ).fetchall()
     conn.close()
     return rows
 
 
-def get_all_active_alerts():
+def get_all_watchable_alerts():
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT id, chat_id, symbol, direction, target_price FROM alerts WHERE triggered = 0"
+        """
+        SELECT id, chat_id, symbol, direction, target_price, label, armed
+        FROM alerts
+        WHERE triggered = 0 AND paused = 0
+        """
     ).fetchall()
     conn.close()
     return rows
@@ -217,6 +273,25 @@ def mark_triggered(alert_id: int):
     )
     conn.commit()
     conn.close()
+
+
+def set_alert_armed(alert_id: int, armed: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE alerts SET armed = ? WHERE id = ?", (armed, alert_id))
+    conn.commit()
+    conn.close()
+
+
+def set_alert_paused(chat_id: int, alert_id: int, paused: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "UPDATE alerts SET paused = ? WHERE id = ? AND chat_id = ? AND triggered = 0",
+        (paused, alert_id, chat_id),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
 
 
 def delete_alert(chat_id: int, alert_id: int) -> bool:
@@ -369,7 +444,8 @@ async def pick_direction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(
         f"{arrow} *{name}* — alert {direction}{price_str}\n\n"
-        f"Now type the target price:",
+        f"Now type the target price.\n"
+        f"You can add a label after it, like `4775 breakout`:",
         parse_mode="Markdown",
     )
     return ENTER_PRICE
@@ -378,9 +454,12 @@ async def pick_direction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def enter_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     try:
-        price = float(text)
+        price, label = parse_price_and_label(text)
     except ValueError:
-        await update.message.reply_text("❌ Invalid price. Type a number like `195.50`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Invalid price. Type a number like `195.50` or `195.50 breakout`",
+            parse_mode="Markdown",
+        )
         return ENTER_PRICE
 
     symbol = ctx.user_data.get("alert_symbol")
@@ -389,18 +468,19 @@ async def enter_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Something went wrong. Use /setalert again.")
         return ConversationHandler.END
 
-    alert_id = add_alert(update.effective_chat.id, symbol, direction, price)
+    alert_id = add_alert(update.effective_chat.id, symbol, direction, price, label)
     name = SYMBOL_NAMES.get(symbol, symbol)
     current = latest_prices.get(symbol)
     cur_str = f"\n📍 Current: {current}" if current else ""
+    label_str = format_label(label)
     arrow = "🔺" if direction == "above" else "🔻"
 
     await update.message.reply_text(
         f"✅ *Alert #{alert_id} Set!*\n\n"
-        f"{arrow} {name} {direction} *{price}*{cur_str}",
+        f"{arrow} {name} {direction} *{price}*{cur_str}{label_str}",
         parse_mode="Markdown",
     )
-    log.info(f"Alert #{alert_id}: {name} {direction} {price}")
+    log.info(f"Alert #{alert_id}: {name} {direction} {price} label={label!r}")
     ctx.user_data.clear()
     return ConversationHandler.END
 
@@ -515,11 +595,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  /setalert → Pick pair & set alert\n"
         "  /price → Check live prices\n\n"
         "*Quick commands:*\n"
-        "  `/alert GBPJPY above 195.50`\n"
+        "  `/alert GBPJPY above 195.50 breakout`\n"
         "  `/price EURUSD`\n\n"
         "*Manage:*\n"
         "  /alerts → List active alerts\n"
         "  /delete ID → Delete an alert\n"
+        "  /pause ID → Pause an alert\n"
+        "  /resume ID → Resume an alert\n"
         "  /clearall → Clear all alerts\n"
         "  /symbols → List all symbols\n"
         "  /help → This message"
@@ -531,7 +613,7 @@ async def cmd_alert_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if not args or len(args) < 3:
         await update.message.reply_text(
-            "❌ Usage: `/alert SYMBOL above|below PRICE`\n"
+            "❌ Usage: `/alert SYMBOL above|below PRICE optional label`\n"
             "Or use /setalert for interactive mode!",
             parse_mode="Markdown",
         )
@@ -553,27 +635,57 @@ async def cmd_alert_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Unknown: `{symbol_input}`\nUse /setalert for interactive mode.", parse_mode="Markdown")
         return
 
-    alert_id = add_alert(update.effective_chat.id, symbol, direction, price)
+    label = " ".join(args[3:]).strip() or None
+    alert_id = add_alert(update.effective_chat.id, symbol, direction, price, label)
     name = SYMBOL_NAMES.get(symbol, symbol)
     current = latest_prices.get(symbol)
     cur_str = f"  (current: {current})" if current else ""
-    await update.message.reply_text(f"✅ Alert #{alert_id}: {name} {direction} {price}{cur_str}")
+    label_str = f" — {md_escape(label)}" if label else ""
+    await update.message.reply_text(
+        f"✅ Alert #{alert_id}: {name} {direction} {price}{cur_str}{label_str}",
+        parse_mode="Markdown",
+    )
+
+
+def build_alerts_view(chat_id: int) -> tuple[str | None, InlineKeyboardMarkup | None]:
+    alerts = get_active_alerts(chat_id)
+    if not alerts:
+        return None, None
+
+    lines = ["📋 *Active Alerts:*\n"]
+    buttons = []
+    current_symbol = None
+
+    for aid, sym, direction, price, label, paused, armed in alerts:
+        name = SYMBOL_NAMES.get(sym, sym)
+        if sym != current_symbol:
+            current_symbol = sym
+            current = latest_prices.get(sym)
+            cur_str = f" — now: *{current}*" if current else ""
+            lines.append(f"\n*{name}*{cur_str}")
+
+        current = latest_prices.get(sym)
+        arrow = "🔺" if direction == "above" else "🔻"
+        state = "paused" if paused else ("waiting for fresh cross" if not armed else "armed")
+        label_str = f" — {md_escape(label)}" if label else ""
+        lines.append(f"  {arrow} `#{aid}` {direction} *{price}* ({state}){label_str}")
+        buttons.append([
+            InlineKeyboardButton(
+                f"{'▶️ Resume' if paused else '⏸ Pause'} #{aid}",
+                callback_data=f"{'aresume' if paused else 'apause'}:{aid}",
+            ),
+            InlineKeyboardButton(f"🗑 Delete #{aid}", callback_data=f"adel:{aid}"),
+        ])
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons) if buttons else None
 
 
 async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    alerts = get_active_alerts(update.effective_chat.id)
-    if not alerts:
+    text, markup = build_alerts_view(update.effective_chat.id)
+    if not text:
         await update.message.reply_text("📭 No active alerts.\nUse /setalert to set one!")
         return
-
-    lines = ["📋 *Active Alerts:*\n"]
-    for aid, sym, direction, price in alerts:
-        name = SYMBOL_NAMES.get(sym, sym)
-        current = latest_prices.get(sym)
-        cur_str = f" (now: {current})" if current else ""
-        arrow = "🔺" if direction == "above" else "🔻"
-        lines.append(f"  {arrow} `#{aid}` {name} {direction} {price}{cur_str}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -591,6 +703,75 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Alert #{aid} not found.")
 
 
+async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Usage: `/pause ID`", parse_mode="Markdown")
+        return
+    try:
+        aid = int(ctx.args[0].replace("#", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID")
+        return
+    if set_alert_paused(update.effective_chat.id, aid, 1):
+        await update.message.reply_text(f"⏸ Alert #{aid} paused.")
+    else:
+        await update.message.reply_text(f"❌ Alert #{aid} not found.")
+
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Usage: `/resume ID`", parse_mode="Markdown")
+        return
+    try:
+        aid = int(ctx.args[0].replace("#", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID")
+        return
+    if set_alert_paused(update.effective_chat.id, aid, 0):
+        await update.message.reply_text(f"▶️ Alert #{aid} resumed.")
+    else:
+        await update.message.reply_text(f"❌ Alert #{aid} not found.")
+
+
+async def refresh_alerts_query(query, chat_id: int, fallback: str):
+    text, markup = build_alerts_view(chat_id)
+    await query.edit_message_text(
+        text or fallback,
+        reply_markup=markup,
+        parse_mode="Markdown",
+    )
+
+
+async def alert_button_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    aid = int(query.data.split(":", 1)[1])
+    if delete_alert(update.effective_chat.id, aid):
+        await query.answer(f"Deleted #{aid}")
+        await refresh_alerts_query(query, update.effective_chat.id, f"🗑 Alert #{aid} deleted.\n\n📭 No active alerts.")
+    else:
+        await query.answer(f"Alert #{aid} not found.", show_alert=True)
+
+
+async def alert_button_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    aid = int(query.data.split(":", 1)[1])
+    if set_alert_paused(update.effective_chat.id, aid, 1):
+        await query.answer(f"Paused #{aid}")
+        await refresh_alerts_query(query, update.effective_chat.id, "📭 No active alerts.")
+    else:
+        await query.answer(f"Alert #{aid} not found.", show_alert=True)
+
+
+async def alert_button_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    aid = int(query.data.split(":", 1)[1])
+    if set_alert_paused(update.effective_chat.id, aid, 0):
+        await query.answer(f"Resumed #{aid}")
+        await refresh_alerts_query(query, update.effective_chat.id, "📭 No active alerts.")
+    else:
+        await query.answer(f"Alert #{aid} not found.", show_alert=True)
+
+
 async def cmd_clearall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     count = delete_all_alerts(update.effective_chat.id)
     await update.message.reply_text(f"🗑 Cleared {count} alert(s).")
@@ -606,9 +787,18 @@ async def cmd_symbols(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Deriv WebSocket ─────────────────────────────────────────────────────
-async def send_telegram_alert(chat_id: int, alert_id: int, symbol: str, direction: str, target: float, current: float):
+async def send_telegram_alert(
+    chat_id: int,
+    alert_id: int,
+    symbol: str,
+    direction: str,
+    target: float,
+    current: float,
+    label: str | None = None,
+):
     name = SYMBOL_NAMES.get(symbol, symbol)
     arrow = "🔺" if direction == "above" else "🔻"
+    label_str = format_label(label)
     msg = (
         f"{arrow} *ALERT TRIGGERED!*\n\n"
         f"📊 *{name}*\n"
@@ -616,6 +806,7 @@ async def send_telegram_alert(chat_id: int, alert_id: int, symbol: str, directio
         f"Current: *{current}*\n"
         f"Alert ID: #{alert_id}\n"
         f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+        f"{label_str}"
     )
     try:
         bot = telegram_app.bot
@@ -626,10 +817,18 @@ async def send_telegram_alert(chat_id: int, alert_id: int, symbol: str, directio
 
 
 def check_alerts(symbol: str, price: float):
-    alerts = get_all_active_alerts()
-    for aid, chat_id, sym, direction, target in alerts:
+    alerts = get_all_watchable_alerts()
+    for aid, chat_id, sym, direction, target, label, armed in alerts:
         if sym != symbol:
             continue
+
+        if not armed:
+            if direction == "above" and price < target:
+                set_alert_armed(aid, 1)
+            elif direction == "below" and price > target:
+                set_alert_armed(aid, 1)
+            continue
+
         triggered = False
         if direction == "above" and price >= target:
             triggered = True
@@ -638,7 +837,7 @@ def check_alerts(symbol: str, price: float):
         if triggered:
             mark_triggered(aid)
             asyncio.get_event_loop().create_task(
-                send_telegram_alert(chat_id, aid, symbol, direction, target, price)
+                send_telegram_alert(chat_id, aid, symbol, direction, target, price, label)
             )
 
 
@@ -703,6 +902,8 @@ async def post_init(application: Application):
         BotCommand("alert", "Quick: /alert SYMBOL above|below PRICE"),
         BotCommand("alerts", "📋 List active alerts"),
         BotCommand("delete", "🗑 Delete alert by ID"),
+        BotCommand("pause", "⏸ Pause alert by ID"),
+        BotCommand("resume", "▶️ Resume alert by ID"),
         BotCommand("clearall", "🗑 Clear all alerts"),
         BotCommand("symbols", "📊 List all symbols"),
         BotCommand("help", "❓ Show help"),
@@ -776,8 +977,13 @@ async def main():
     telegram_app.add_handler(CommandHandler("alert", cmd_alert_quick))
     telegram_app.add_handler(CommandHandler("alerts", cmd_alerts))
     telegram_app.add_handler(CommandHandler("delete", cmd_delete))
+    telegram_app.add_handler(CommandHandler("pause", cmd_pause))
+    telegram_app.add_handler(CommandHandler("resume", cmd_resume))
     telegram_app.add_handler(CommandHandler("clearall", cmd_clearall))
     telegram_app.add_handler(CommandHandler("symbols", cmd_symbols))
+    telegram_app.add_handler(CallbackQueryHandler(alert_button_delete, pattern="^adel:"))
+    telegram_app.add_handler(CallbackQueryHandler(alert_button_pause, pattern="^apause:"))
+    telegram_app.add_handler(CallbackQueryHandler(alert_button_resume, pattern="^aresume:"))
 
     async with telegram_app:
         await telegram_app.start()
